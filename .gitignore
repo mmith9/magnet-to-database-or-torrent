@@ -1,0 +1,17 @@
+/.vscode
+/find_files_in_db.py
+/monthly_update.py
+/my_torrent_stuff.txt
+/old_tpb_to_db.py
+/push_torrents_to_db.py
+/push_to_db.py
+/push_used_hashes.py
+/torrent.txt
+/verify_files.py
+/_r
+/_sqlite3
+/_test
+/_testdir
+/__main__.log
+/__main__.txt
+/__pycache__
