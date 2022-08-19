@@ -181,6 +181,8 @@ class Trackers:
 class Resolver:
     def __init__(self) -> None:
         logger.debug('object initialization')
+
+        self.last_job_spawn = 0
         self.jobs: List[Job]
         self.timeout_jobs: List[Job]
         self.jobs = []
@@ -207,19 +209,36 @@ class Resolver:
             sys.exit()
 
         logger.debug('initializing libtorrent session')
+        self.session_settings = libtorrent.default_settings()
+        self.session_settings['listen_interfaces'] = '0.0.0.0:6818'
+        self.session_settings['peer_fingerprint'] = 'non-default-finger-print'
+        self.session_settings['announce_to_all_trackers']=True #False
+        self.session_settings['validate_https_trackers'] = False #true
+        self.session_settings['tracker_completion_timeout'] = 30 #30
+        self.session_settings['connection_speed	']=20 #30
+        self.session_settings['connections_limit']=10000 #200
+        self.session_settings['listen_queue_size']=1000 #5
+        self.session_settings['torrent_connect_boost']=20 #30
+        self.session_settings['max_concurrent_http_announces']=10000 #50
+        self.session_settings['dht_max_dht_items']=70000 #700
+        self.session_settings['dht_max_torrent_search_reply']=50 #20
+        self.session_settings['dht_block_ratelimit']=100 #5
+        self.session_settings['dht_max_infohashes_sample_count']=50 #20
+
         self.lt_session = libtorrent.session()
         self.lt_params = libtorrent.add_torrent_params()
         ltflags = libtorrent.add_torrent_params_flags_t
 
         self.lt_params.flags &= ~ ltflags.flag_auto_managed
         self.lt_params.flags |= ltflags.flag_upload_mode
+        
 
         # necessary as upload-only does not prevent creation of
         # empty files and directory structure under them
         self.tmpdir = tempfile.TemporaryDirectory()
         self.lt_params.save_path = self.tmpdir.name
         self.lt_params.storage_mode = libtorrent.storage_mode_t(2)
-        self.lt_params.max_connections = 2
+        self.lt_params.max_connections = 5
 
     def get_trackers(self):
         #self.trackers.load_from_file('trackerlist.txt')
@@ -274,8 +293,17 @@ class Resolver:
         job.handle.resume()
         self.jobs.append(job)
         _cur_trackers = job.handle.trackers()
+        self.last_job_spawn = time.time()
+
         logger.debug('hashes %s, running %s, sleeping %s',
                      len(self.hashes_to_resolve), len(self.jobs), len(self.timeout_jobs))
+
+    def can_spawn_job(self) -> bool:
+        tmp_bool = True
+        tmp_bool = tmp_bool and time.time() > self.last_job_spawn + args.spawn * (1 + len(self.jobs)/2000)
+        tmp_bool = tmp_bool and (self.hashes_to_resolve or self.timeout_jobs)
+        tmp_bool = tmp_bool and len(self.jobs) < args.threads
+        return tmp_bool
 
     def end_a_job(self, job):
         logger.debug('Removing a job completely')
@@ -305,6 +333,7 @@ class Resolver:
         self.jobs.append(job)
         logger.debug('hashes %s, running %s, sleeping %s',
                      len(self.hashes_to_resolve), len(self.jobs), len(self.timeout_jobs))
+        self.last_job_spawn = time.time()
 
     def offload_aged_job(self, job: Job):
         logger.debug('offloading aged job to db')
@@ -366,18 +395,25 @@ class Resolver:
         """ Main part of program, once initialized runs indefinitely
             or until jobs are done (unlikely)
         """
+
         while self.jobs or self.hashes_to_resolve or self.timeout_jobs:
-            while (len(self.jobs) < args.threads) and (self.hashes_to_resolve or self.timeout_jobs):
+            if self.can_spawn_job():
                 if self.hashes_to_resolve:
                     self.spawn_a_job()
                 else:
                     self.wake_a_job()
-                self.print_stats_inline()
-                time.sleep(args.spawn)
 
-            time.sleep(10)
-
+            count = 0
             for job in reversed(self.jobs):
+                if self.can_spawn_job():
+                    if self.hashes_to_resolve:
+                        self.spawn_a_job()
+                    else:
+                        self.wake_a_job()
+
+                time.sleep(args.heartbeat)
+
+                count +=1
                 if job.is_complete():
                     #output = job.reap_data()
                     # self.push_resolved_hash_to_db(output)
@@ -396,14 +432,15 @@ class Resolver:
                     self.count.increase('resolved', 1)
                     logger.debug('Saved resolved job')
 
-                elif job.is_timeout():
-                    self.enqueue_a_job(job)
                 elif job.is_aged():
                     self.trackers.report_failure(job)
                     self.offload_aged_job(job)
 
+                elif job.is_timeout():
+                    self.enqueue_a_job(job)
+
                 self.print_stats_inline()
-                time.sleep(args.spawn)
+
 
             logger.info('new %s, old %s, resolved %s, offloaded %s',
                         self.count.value_of('new'), self.count.value_of('old'),
@@ -414,7 +451,6 @@ class Resolver:
             self.print_stats_inline()
 
         logger.info('No more jobs')
-
 
 def main():
     resolver = Resolver()
@@ -430,14 +466,14 @@ def main():
         old_resolver.lt_session.pause()
         resolver = Resolver()
         resolver.count = old_resolver.count
-        time.sleep(30)
+        time.sleep(3)
         del old_resolver
 
 
 if __name__ == "__main__":
     import logging
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARNING)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     fh = logging.FileHandler(__name__ + '.txt')
     fh.setLevel(logging.DEBUG)
@@ -446,7 +482,7 @@ if __name__ == "__main__":
     sh.setLevel(logging.INFO)
     sh.setFormatter(formatter)
 
-    logger.addHandler(fh)
+    #logger.addHandler(fh)
     logger.addHandler(sh)
 
     from argparse import ArgumentParser
@@ -473,8 +509,12 @@ if __name__ == "__main__":
     parser.add_argument('-maxold', dest='maxold', default=100, type=int,
                         help='maximum old hashes at once')
 
+    parser.add_argument('-hb', '--heartbeat', dest='heartbeat', default=10, type=int,
+                        help='sleep time between actions')
+
     parser.add_argument('--version', action='version', version=VERSION)
     args = parser.parse_args()
     args.spawn = args.spawn / 1000
+    args.heartbeat = args.heartbeat / 1000
 
     main()
