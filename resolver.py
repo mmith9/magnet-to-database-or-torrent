@@ -114,8 +114,17 @@ class Trackers:
             self.list.append({'url':row.strip('\n'), 'uses':0, 'resolves':0, 'ratio':0})
         self.num = len(self.list)
 
-    def load_from_db(self, cursor):
-        query = 'select url, uses, resolves, ratio from trackers'
+    def load_from_db(self, cursor, protocols):
+        if 'udp' and 'tcp' in protocols:
+            query = 'select url, uses, resolves, ratio from trackers '
+        elif 'udp' in protocols:
+            query = 'select url, uses, resolves, ratio from trackers where url like "udp%" '
+        elif 'tcp' in protocols:
+            query = 'select url, uses, resolves, ratio from trackers where url like "htt%" '
+        else:
+            logger.critical('No protocols (udp/tcp) defined')
+            sys.exit()
+
         cursor.execute(query)
         rows = cursor.fetchall()
         for row in rows:
@@ -209,41 +218,51 @@ class Resolver:
             sys.exit()
 
         logger.debug('initializing libtorrent session')
+        self.protocols = ['udp', 'tcp']
         self.session_settings = libtorrent.default_settings()
         self.session_settings['listen_interfaces'] = '0.0.0.0:6818'
         self.session_settings['peer_fingerprint'] = 'non-default-finger-print'
         self.session_settings['announce_to_all_trackers']=True #False
         self.session_settings['validate_https_trackers'] = False #true
         self.session_settings['tracker_completion_timeout'] = 30 #30
-        self.session_settings['connection_speed	']=20 #30
-        self.session_settings['connections_limit']=10000 #200
-        self.session_settings['listen_queue_size']=1000 #5
-        self.session_settings['torrent_connect_boost']=20 #30
-        self.session_settings['max_concurrent_http_announces']=10000 #50
+        self.session_settings['connection_speed']=10 #30
+        self.session_settings['connections_limit']=500 #200
+        self.session_settings['listen_queue_size']=5 #5
+        self.session_settings['torrent_connect_boost']=3 #30
+        self.session_settings['max_concurrent_http_announces']=50 #50
         self.session_settings['dht_max_dht_items']=70000 #700
         self.session_settings['dht_max_torrent_search_reply']=50 #20
         self.session_settings['dht_block_ratelimit']=100 #5
         self.session_settings['dht_max_infohashes_sample_count']=50 #20
+        self.session_settings['prefer_udp_trackers'] = True
+        self.session_settings['enable_outgoing_utp'] = 'udp' in self.protocols
+        self.session_settings['enable_incoming_utp'] = 'udp' in self.protocols
+        self.session_settings['enable_outgoing_tcp'] = 'tcp' in self.protocols
+        self.session_settings['enable_incoming_tcp'] = 'tcp' in self.protocols
 
+        
         self.lt_session = libtorrent.session()
+        self.lt_session.apply_settings(self.session_settings)
+        self.sessions_throttle = 0
+  
         self.lt_params = libtorrent.add_torrent_params()
         ltflags = libtorrent.add_torrent_params_flags_t
 
         self.lt_params.flags &= ~ ltflags.flag_auto_managed
         self.lt_params.flags |= ltflags.flag_upload_mode
-        
+
 
         # necessary as upload-only does not prevent creation of
         # empty files and directory structure under them
         self.tmpdir = tempfile.TemporaryDirectory()
         self.lt_params.save_path = self.tmpdir.name
         self.lt_params.storage_mode = libtorrent.storage_mode_t(2)
-        self.lt_params.max_connections = 5
+        self.lt_params.max_connections = 3
 
     def get_trackers(self):
         #self.trackers.load_from_file('trackerlist.txt')
         #self.save_trackers()
-        self.trackers.load_from_db(self.cursor)
+        self.trackers.load_from_db(self.cursor, self.protocols)
 
     def save_trackers(self):
         self.trackers.save_to_db(self.cursor)
@@ -300,7 +319,11 @@ class Resolver:
 
     def can_spawn_job(self) -> bool:
         tmp_bool = True
-        tmp_bool = tmp_bool and time.time() > self.last_job_spawn + args.spawn * (1 + len(self.jobs)/2000)
+        if self.sessions_throttle:
+            tmp_bool = tmp_bool and time.time() > \
+            self.last_job_spawn + args.spawn * (1 + len(self.jobs)/self.sessions_throttle)
+        else:
+            tmp_bool = tmp_bool and time.time() > self.last_job_spawn + args.spawn
         tmp_bool = tmp_bool and (self.hashes_to_resolve or self.timeout_jobs)
         tmp_bool = tmp_bool and len(self.jobs) < args.threads
         return tmp_bool
@@ -488,11 +511,6 @@ if __name__ == "__main__":
     from argparse import ArgumentParser
     parser = ArgumentParser(
         description='Unknown/incomplete info hash resolver')
-    # parser.add_argument('hash', help='a hash to push to db')
-    # parser.add_argument('-f', '--file', action='store_true', dest='file',\
-    #  help='Use file with hashes instead, one per line')
-    # parser.add_argument('-d', '--dir', action='store_true', dest='dir', \
-    # help='Directory with .torrent files')
 
     parser.add_argument('-d', '-dir', dest='torrents_dir', default='', type=str,
                         help='directory to save torrent files, default don\'t save')
